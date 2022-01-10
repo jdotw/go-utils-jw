@@ -2,8 +2,9 @@ package jwt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"os"
+	"net/http"
 
 	"github.com/go-kit/kit/endpoint"
 	"github.com/golang-jwt/jwt/v4"
@@ -53,6 +54,19 @@ var (
 	ErrUnexpectedSigningMethod = errors.New("unexpected signing method")
 )
 
+type Jwks struct {
+	Keys []JSONWebKeys `json:"keys"`
+}
+
+type JSONWebKeys struct {
+	Kty string   `json:"kty"`
+	Kid string   `json:"kid"`
+	Use string   `json:"use"`
+	N   string   `json:"n"`
+	E   string   `json:"e"`
+	X5c []string `json:"x5c"`
+}
+
 // NewSigner creates a new JWT generating middleware, specifying key ID,
 // signing string, signing method and the claims you would like it to contain.
 // Tokens are signed with a Key ID header (kid) which is useful for determining
@@ -98,13 +112,42 @@ func StandardClaimsFactory() jwt.Claims {
 type Authenticator struct {
 	logger log.Factory
 	tracer opentracing.Tracer
+
+	jwks    *Jwks
+	jwksURL string
 }
 
-func NewAuthenticator(logger log.Factory, tracer opentracing.Tracer) Authenticator {
-	return Authenticator{
-		logger: logger,
-		tracer: tracer,
+func NewAuthenticator(logger log.Factory, tracer opentracing.Tracer, jwksURL string) Authenticator {
+	a := Authenticator{
+		logger:  logger,
+		tracer:  tracer,
+		jwksURL: jwksURL,
 	}
+
+	jwks, err := a.getJWKS()
+	if err != nil {
+		a.logger.Bg().Fatal(err.Error())
+	}
+	a.jwks = jwks
+
+	return a
+}
+
+func (a *Authenticator) getJWKS() (*Jwks, error) {
+	resp, err := http.Get(a.jwksURL)
+
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var jwks = Jwks{}
+	err = json.NewDecoder(resp.Body).Decode(&jwks)
+	if err != nil {
+		return nil, err
+	}
+
+	return &jwks, nil
 }
 
 // NewMiddleware creates an Endpoint middleware
@@ -112,10 +155,25 @@ func NewAuthenticator(logger log.Factory, tracer opentracing.Tracer) Authenticat
 // by the transport layers.
 // The signing string is read from the JWT_SIGNATURE env var
 func (a *Authenticator) NewMiddleware() endpoint.Middleware {
-	kf := func(token *jwt.Token) (interface{}, error) { return []byte(os.Getenv("JWT_SIGNATURE")), nil }
-	method := jwt.SigningMethodHS256
-	newClaims := StandardClaimsFactory
-	return newParser(kf, method, newClaims, *a)
+	kf := func(token *jwt.Token) (interface{}, error) {
+		// Find matching Key in JWKS
+		var cert string
+		for k := range a.jwks.Keys {
+			if token.Header["kid"] == a.jwks.Keys[k].Kid {
+				cert = "-----BEGIN CERTIFICATE-----\n" + a.jwks.Keys[k].X5c[0] + "\n-----END CERTIFICATE-----"
+			}
+		}
+		if len(cert) == 0 {
+			err := errors.New("invalid key id")
+			return token, err
+		}
+
+		// Return Public Key
+		result, _ := jwt.ParseRSAPublicKeyFromPEM([]byte(cert))
+		return result, nil
+	}
+	method := jwt.SigningMethodRS256
+	return newParser(kf, method, MapClaimsFactory, *a)
 }
 
 func extractTokenFromContext(ctx context.Context) (*string, error) {
